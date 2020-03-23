@@ -1,17 +1,9 @@
 defmodule SkypeLite do
   use Application
   @moduledoc """
-  Documentation for SkypeLite.
   """
 
   @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> SkypeLite.hello()
-      :world
-
   """
   def start(_type, _args) do
     IO.inspect("Starting!");
@@ -32,6 +24,10 @@ end
 
 defmodule Simulation do
   use GenServer
+  @moduledoc """
+    This simulation spwans all of the processes needed to run the system, and directs client
+    behavior to exercise the network.
+  """
 
   def start_link(_state) do
     # [ Clients, Super Nodes ]
@@ -108,6 +104,11 @@ defmodule Server do
 
     Masks are string representations of hex numbers, which are compared to the 
     top n-bits of the hashed client name.
+
+    Example:
+      16 super nodes
+      width = 1 (16 machines can be represented in a single hex character "0" -> "F")
+      masks = [ "0", "1", "2", ..., "F" ]
   """
   def get_masks(num) do
     # Should only be using power-of-two numbers
@@ -115,6 +116,7 @@ defmodule Server do
     # IO.inspect(["BITS: ", num_bits])
     nums     = Enum.to_list(0..num);
     masks    = Enum.reduce(nums, [], fn id, acc ->
+      # Make sure each has a standardized width (i.e. "1" -> "001" if width = 3)
       mask = String.pad_leading(Integer.to_string(id, 16), width, "0");
       [ mask | acc ]
     end)
@@ -157,19 +159,35 @@ defmodule Server do
   end
 
   @doc """
+    Processes the given name to get the section of hex bits used to match against 
+    a super node code.
+
+    Example:
+      "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
+  """
+  def get_hash(state, name) do
+    mask_width = Enum.at(state, 0);
+
+    # Get the hash-based information
+    hash       = :crypto.hash(:md5, name) |> Base.encode16;
+    hash_match = String.slice(hash, 0..(mask_width-1));
+    
+    hash_match
+  end
+
+  @doc """
     Handles the user registration process.
   """
   @impl true
   def handle_call({:register, name}, _from, state) do 
     users = Enum.at(state, 2);
 
-    # Is there already a user with this name?
-    match = :ets.lookup(users, String.to_atom(name))
-    # IO.inspect([match]);
 
-    if match == [] do
-      # Init the user's conact list to be empty
-      :ets.insert(users, {String.to_atom(name), []})
+    # Init the user's conact list to be empty
+    result = :ets.insert_new(users, {String.to_atom(name), []})
+
+    # Is there already a user with this name?
+    if result != false do
       {:reply, :ok, state}
     else
       {:reply, :name_claimed, state}
@@ -181,7 +199,6 @@ defmodule Server do
   """
   @impl true
   def handle_call({:join, name}, _from, state) do 
-    mask_width = Enum.at(state,0);
     supers     = Enum.at(state,1);
     users      = Enum.at(state,2);
 
@@ -190,8 +207,7 @@ defmodule Server do
 
     if match != [] do
       # Hash the name to determine who to match it with
-      hash       = :crypto.hash(:md5, name) |> Base.encode16;
-      hash_match = String.slice(hash, 0..(mask_width-1));
+      hash_match = get_hash(state, name);
       # Look up the corresponding super node
       matching_super = Map.get(supers, hash_match);
       # Strip away the wrapping structures
@@ -201,6 +217,19 @@ defmodule Server do
     else
       {:reply, :not_registered, state}
     end    
+  end
+
+  @doc """
+    Updates a user's contact list.
+  """
+  @impl true
+  def handle_call({:update, name, list}, _from, state) do 
+    users      = Enum.at(state,2);
+
+    # Update the client information
+    :ets.insert(users, {String.to_atom(name), list});
+
+    {:reply, :ok, state}
   end
 end
 
@@ -238,19 +267,34 @@ defmodule Super do
   end
 
   @doc """
+    Helper function to avoid code replication. Processes the given name to ge the 
+    section of hex bits used to match against a super node code.
+
+    Example:
+      "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
+  """
+  def get_hash(state, name) do
+    mask_width = Enum.at(state, 0);
+
+    # Get the hash-based information
+    hash       = :crypto.hash(:md5, name) |> Base.encode16;
+    hash_match = String.slice(hash, 0..(mask_width-1));
+    
+    hash_match
+  end
+
+  @doc """
     This is called after a client has successfully signed in to top-level server. Clients
     using this function are registered to be found by others in the network.
   """
   @impl true
   def handle_call({:join, name}, from, state) do
-    mask_width = Enum.at(state, 0);
     supers     = Enum.at(state, 1);
     my_names = Enum.at(state, 2);
 
 
     # Get the hash-based information
-    hash       = :crypto.hash(:md5, name) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(mask_width-1));
+    hash_match = get_hash(state, name);
     contact_point = Map.get(supers, hash_match);
 
     # We're only accepting the clients for our list. 
@@ -265,20 +309,43 @@ defmodule Super do
     end
   end
 
+
+  @doc """
+    This is called when a client is logging off of the network (no longer avaialble).
+  """
+  @impl true
+  def handle_call({:leave, name}, from, state) do
+    supers     = Enum.at(state, 1);
+    my_names   = Enum.at(state, 2);
+
+    # Get the hash-based information
+    hash_match = get_hash(state, name);
+    contact_point = Map.get(supers, hash_match);
+
+    # Are we in charge of this client? Make sure to check the client name against requester
+    same_person = Map.get(my_names, name) == elem(from, 0);
+    if contact_point == self() && same_person do
+      new_map = Map.delete(my_names, name);
+      new_state = List.replace_at(state, 2, new_map);
+      {:reply, :ok, new_state}
+    else
+      {:reply, :invalid_request, state}
+    end
+
+  end
+
   @doc """
     Used to search for a target client. Returns a PID/IP if found, otherwise nil.
   """
   @impl true
   def handle_call({:lookup, target}, _from, state) do
-    mask_width = Enum.at(state, 0);
     supers     = Enum.at(state, 1);
     my_names   = Enum.at(state, 2);
 
     # IO.inspect(["LOOKUP @", self(), target]);
 
     # Hash the name to determine which supervisor to contact
-    hash       = :crypto.hash(:md5, target) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(mask_width-1));
+    hash_match = get_hash(state, target);
 
     # Figure out who to talk to
     contact_point = Map.get(supers, hash_match);
