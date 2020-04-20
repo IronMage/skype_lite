@@ -21,6 +21,46 @@ defmodule SkypeLite do
   end
 end
 
+defmodule Signature do
+  def compare_pid(target, user) do
+    "#{inspect target}" == "#{inspect user}"
+  end
+
+  def sign(private, user, ttl \\ 30, scale \\ :second) do
+    # Get the important time information
+    time    = Time.utc_now();
+    expires = Time.to_string(Time.add(time,ttl,scale));
+    # Convert the data to strings for signing
+    token   = "#{inspect user}<|>#{expires}";
+    # Sign the data
+    text = :public_key.encrypt_private(token, private, []);
+    text
+  end
+
+  def check(public, signed, user) do
+    # Decrypt the data using the public key
+    data = :public_key.decrypt_public(signed, public, []);
+    # Did the decryption result in valid data?
+    if String.valid?(data) and String.contains?(data, "<|>") do
+      # Split our string
+      [target, expires] = String.split(data, "<|>");
+      check_time = Time.from_iso8601(expires);
+      # Has the data expired?
+      time_diff = Time.compare(Time.utc_now(),check_time);
+      if compare_pid(target, user) do
+        if time_diff == :lt do
+          :confirmed
+        else
+          :expired
+        end
+      else
+        :wrong_user
+      end
+    end
+  end
+
+end
+
 
 defmodule Simulation do
   use GenServer
@@ -64,7 +104,7 @@ defmodule Simulation do
   end
 
   @impl true
-  def handle_call({:start}, _from, state) do 
+  def handle_call({:start}, _from, state) do
     [top_server, clients, pid_map]  = start_children(state)
 
     # IO.inspect([top_server, clients])
@@ -76,7 +116,7 @@ defmodule Simulation do
 
     # Test the lookup function
     test   = Enum.random(clients);
-    target = Enum.random(clients -- [test]); 
+    target = Enum.random(clients -- [test]);
     GenServer.cast(test, {:lookup, Map.get(pid_map, target)});
 
     # Needs a better stop condition
@@ -91,7 +131,7 @@ end
 defmodule Server do
   use GenServer
   @moduledoc """
-    This is the top-level server.  All clients are required to sign-in/register 
+    This is the top-level server.  All clients are required to sign-in/register
     with this server before they are able to use any other actions the system provides.
   """
 
@@ -100,9 +140,27 @@ defmodule Server do
   end
 
   @doc """
-    Creates bitmasks used to spread the clients many super nodes.  
+    Retreives the public/private keypair form the local disk.
+  """
+  def get_keys() do
+    {:ok, priv_pem} = File.read("./private_key.pem")
+    {:ok, pub_pem}  = File.read("./public_key.pem")
+    [priv_pem_entry | _ ] = :public_key.pem_decode(priv_pem)
+    [pub_pem_entry | _ ]  = :public_key.pem_decode(pub_pem)
+    # Assuming first entry is the key you want (or only one key)
+    private_key = :public_key.pem_entry_decode(priv_pem_entry)
+    public_key  = :public_key.pem_entry_decode(pub_pem_entry)
+    # text = :public_key.encrypt_public("plaintext", public_key, [])
 
-    Masks are string representations of hex numbers, which are compared to the 
+    # IO.inspect(text)
+    # text
+    [public_key, private_key]
+  end
+
+  @doc """
+    Creates bitmasks used to spread the clients many super nodes.
+
+    Masks are string representations of hex numbers, which are compared to the
     top n-bits of the hashed client name.
 
     Example:
@@ -131,6 +189,11 @@ defmodule Server do
   def init(state) do
     # IO.inspect(state);
 
+    IO.puts("Getting keys..");
+    [_public, _private] = get_keys();
+    IO.puts("Got keys.");
+
+
     # Get info
     num_supers  = Enum.at(state,0)-1;
 
@@ -142,8 +205,8 @@ defmodule Server do
       {_ignore, spr}    = GenServer.start_link(Super, [Map.new()]);
       Map.put(acc, mask, spr);
     end);
-    
-    # Create a database for the contact list.  Set = unique keys, 
+
+    # Create a database for the contact list.  Set = unique keys,
     # Private = only this process can access
     users = :ets.new(:contact_list, [:set, :private]);
 
@@ -159,7 +222,7 @@ defmodule Server do
   end
 
   @doc """
-    Processes the given name to get the section of hex bits used to match against 
+    Processes the given name to get the section of hex bits used to match against
     a super node code.
 
     Example:
@@ -171,7 +234,7 @@ defmodule Server do
     # Get the hash-based information
     hash       = :crypto.hash(:md5, name) |> Base.encode16;
     hash_match = String.slice(hash, 0..(mask_width-1));
-    
+
     hash_match
   end
 
@@ -179,7 +242,7 @@ defmodule Server do
     Handles the user registration process.
   """
   @impl true
-  def handle_call({:register, name}, _from, state) do 
+  def handle_call({:register, name}, _from, state) do
     users = Enum.at(state, 2);
 
 
@@ -198,7 +261,7 @@ defmodule Server do
     Handles a client's attempt to log in.
   """
   @impl true
-  def handle_call({:join, name}, _from, state) do 
+  def handle_call({:join, name}, _from, state) do
     supers     = Enum.at(state,1);
     users      = Enum.at(state,2);
 
@@ -216,14 +279,14 @@ defmodule Server do
       {:reply, [ matching_super, contacts ], state}
     else
       {:reply, :not_registered, state}
-    end    
+    end
   end
 
   @doc """
     Updates a user's contact list.
   """
   @impl true
-  def handle_call({:update, name, list}, _from, state) do 
+  def handle_call({:update, name, list}, _from, state) do
     users      = Enum.at(state,2);
 
     # Update the client information
@@ -237,7 +300,7 @@ end
 defmodule Super do
   use GenServer
   @moduledoc """
-    Super nodes superimpose hierarchy onto an otherwise P2P network.  They are responsible 
+    Super nodes superimpose hierarchy onto an otherwise P2P network.  They are responsible
     mapping their client PID/IP to their user name.
   """
 
@@ -252,7 +315,7 @@ defmodule Super do
   def init(state) do
     # IO.inspect(state);
     {:ok, state}
-  end  
+  end
 
   @doc """
     This function is required to be handled before normal operations can commence.  This
@@ -267,7 +330,7 @@ defmodule Super do
   end
 
   @doc """
-    Helper function to avoid code replication. Processes the given name to ge the 
+    Helper function to avoid code replication. Processes the given name to ge the
     section of hex bits used to match against a super node code.
 
     Example:
@@ -279,7 +342,7 @@ defmodule Super do
     # Get the hash-based information
     hash       = :crypto.hash(:md5, name) |> Base.encode16;
     hash_match = String.slice(hash, 0..(mask_width-1));
-    
+
     hash_match
   end
 
@@ -297,7 +360,7 @@ defmodule Super do
     hash_match = get_hash(state, name);
     contact_point = Map.get(supers, hash_match);
 
-    # We're only accepting the clients for our list. 
+    # We're only accepting the clients for our list.
     if contact_point == self() do
       # Add a new entry for the client. "from" has extra data, just strip the PID
       updated_map = Map.put(my_names, name, elem(from, 0));
@@ -370,7 +433,7 @@ end
 defmodule Client do
   use GenServer
   @moduledoc """
-    Used by the clients in the network.  Currently controlled by the simulation to 
+    Used by the clients in the network.  Currently controlled by the simulation to
     interact with the system.
   """
 

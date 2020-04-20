@@ -1,0 +1,10 @@
+{application,skype_lite,
+             [{applications,[kernel,stdlib,elixir,logger,ecc]},
+              {description,"skype_lite"},
+              {modules,['Elixir.Client','Elixir.Server','Elixir.Signature',
+                        'Elixir.Simulation','Elixir.SkypeLite',
+                        'Elixir.Super']},
+              {registered,[]},
+              {vsn,"0.1.0"},
+              {error,{"no such file or directory","Elixir.SkypeLite.app"}},
+              {mod,{'Elixir.SkypeLite',[]}}]}.
