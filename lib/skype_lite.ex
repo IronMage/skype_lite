@@ -23,7 +23,19 @@ end
 
 defmodule Signature do
   def compare_pid(target, user) do
-    "#{inspect target}" == "#{inspect user}"
+    # IO.inspect(["Comparing", target, user]);
+    cond do
+      (String.valid?(user) and String.valid?(target)) or (is_pid(user) and is_pid(target)) ->
+        target == user;
+      is_pid(user) and String.valid?(target) ->
+        temp = "#{inspect user}";
+        "#{inspect target}" == "#{inspect temp}";
+      String.valid?(user) and is_pid(target) ->
+        temp = "#{inspect target}";
+        "#{inspect target}" == "#{inspect temp}";
+      true ->
+        false
+    end
   end
 
   def sign(private, user, ttl \\ 30, scale \\ :second) do
@@ -44,12 +56,12 @@ defmodule Signature do
     if String.valid?(data) and String.contains?(data, "<|>") do
       # Split our string
       [target, expires] = String.split(data, "<|>");
-      check_time = Time.from_iso8601(expires);
+      {_, check_time}   = Time.from_iso8601(expires);
       # Has the data expired?
       time_diff = Time.compare(Time.utc_now(),check_time);
       if compare_pid(target, user) do
         if time_diff == :lt do
-          :confirmed
+          :ok
         else
           :expired
         end
@@ -189,9 +201,11 @@ defmodule Server do
   def init(state) do
     # IO.inspect(state);
 
-    IO.puts("Getting keys..");
+    # IO.puts("Getting keys..");
+
     [_public, _private] = get_keys();
-    IO.puts("Got keys.");
+
+    # IO.puts("Got keys.");
 
 
     # Get info
@@ -305,16 +319,16 @@ defmodule Super do
   """
 
   def start_link(_state) do
-    GenServer.start_link(__MODULE__, [:super_nums])
+    GenServer.start_link(__MODULE__, [])
   end
 
   @doc """
     No initializations can be done during spawn time.
   """
   @impl true
-  def init(state) do
+  def init(_state) do
     # IO.inspect(state);
-    {:ok, state}
+    {:ok, Map.new()}
   end
 
   @doc """
@@ -324,9 +338,9 @@ defmodule Super do
   @impl true
   def handle_cast({:map, [ mask_width, supers ]}, state) do
     # Used for communication between other super nodes
-    new_state = [mask_width | [ supers | state ]];
-
-    {:noreply, new_state}
+    with_supers = Map.put(state, :supers, supers);
+    with_width  = Map.put(with_supers, :mask_width, mask_width);
+    {:noreply, with_width}
   end
 
   @doc """
@@ -336,13 +350,10 @@ defmodule Super do
     Example:
       "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
   """
-  def get_hash(state, name) do
-    mask_width = Enum.at(state, 0);
-
+  def get_hash(width, name) do
     # Get the hash-based information
     hash       = :crypto.hash(:md5, name) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(mask_width-1));
-
+    hash_match = String.slice(hash, 0..(width-1));
     hash_match
   end
 
@@ -352,21 +363,22 @@ defmodule Super do
   """
   @impl true
   def handle_call({:join, name}, from, state) do
-    supers     = Enum.at(state, 1);
-    my_names = Enum.at(state, 2);
+    supers     = Map.get(state, :supers);
+    my_names   = Map.get(state, :names, Map.new());
+    mask_width = Map.get(state, :mask_width);
 
 
     # Get the hash-based information
-    hash_match = get_hash(state, name);
+    hash_match = get_hash(mask_width, name);
     contact_point = Map.get(supers, hash_match);
 
     # We're only accepting the clients for our list.
     if contact_point == self() do
       # Add a new entry for the client. "from" has extra data, just strip the PID
-      updated_map = Map.put(my_names, name, elem(from, 0));
-
+      updated_names = Map.put(my_names, name, elem(from, 0));
+      updated_state = Map.put(state, :names, updated_names);
       # IO.inspect(["JOINED at Super Node", self(), updated_map]);
-      {:reply, :ok, List.replace_at(state, 2, updated_map)}
+      {:reply, :ok, updated_state}
     else
       {:reply, :out_of_scope, state}
     end
@@ -378,18 +390,19 @@ defmodule Super do
   """
   @impl true
   def handle_call({:leave, name}, from, state) do
-    supers     = Enum.at(state, 1);
-    my_names   = Enum.at(state, 2);
+    supers     = Map.get(state, :supers);
+    my_names   = Map.get(state, :names, Map.new());
+    mask_width = Map.get(state, :mask_width);
 
     # Get the hash-based information
-    hash_match = get_hash(state, name);
+    hash_match = get_hash(mask_width, name);
     contact_point = Map.get(supers, hash_match);
 
     # Are we in charge of this client? Make sure to check the client name against requester
     same_person = Map.get(my_names, name) == elem(from, 0);
     if contact_point == self() && same_person do
-      new_map = Map.delete(my_names, name);
-      new_state = List.replace_at(state, 2, new_map);
+      new_names = Map.delete(my_names, name);
+      new_state = Map.put(state, :names, new_names);
       {:reply, :ok, new_state}
     else
       {:reply, :invalid_request, state}
@@ -402,29 +415,31 @@ defmodule Super do
   """
   @impl true
   def handle_call({:lookup, target}, _from, state) do
-    supers     = Enum.at(state, 1);
-    my_names   = Enum.at(state, 2);
+    supers     = Map.get(state, :supers);
+    my_names   = Map.get(state, :names, Map.new());
+    mask_width = Map.get(state, :mask_width);
 
     # IO.inspect(["LOOKUP @", self(), target]);
 
     # Hash the name to determine which supervisor to contact
-    hash_match = get_hash(state, target);
+    hash_match = get_hash(mask_width, target);
 
     # Figure out who to talk to
     contact_point = Map.get(supers, hash_match);
 
-    if ( contact_point != self() )  do
-      # Pass on the target
-      pid = GenServer.call(contact_point, {:lookup, target});
-      # IO.inspect(["RETURNING", pid]);
-      {:reply, pid, state}
-    else
-      # Default the failed lookup to nil
-      pid = Map.get(my_names, target, nil);
-      # IO.inspect(["RETURNING", pid]);
-      {:reply, pid, state}
+    cond do
+      contact_point == self() ->
+        # Attempt local lookup
+        pid = Map.get(my_names, target, nil);
+        {:reply, pid, state}
+      contact_point != nil ->
+        # Attempt remote query
+        pid = GenServer.call(contact_point, {:lookup, target});
+        {:reply, pid, state}
+      true ->
+        # Attempting to access a non-mapped server
+        {:reply, :no_matching_super, state}
     end
-
   end
 
 end
