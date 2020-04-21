@@ -147,8 +147,9 @@ defmodule Server do
     with this server before they are able to use any other actions the system provides.
   """
 
-  def start_link(_state) do
-    GenServer.start_link(__MODULE__, [:server_nums])
+  def start_link(state) do
+    server_params = Map.new([{:num_supers, Enum.at(state,0)}]);
+    GenServer.start_link(__MODULE__, server_params);
   end
 
   @doc """
@@ -175,16 +176,18 @@ defmodule Server do
     Masks are string representations of hex numbers, which are compared to the
     top n-bits of the hashed client name.
 
+    NOTE: Inputs should be in powers of 16.
+
     Example:
       16 super nodes
       width = 1 (16 machines can be represented in a single hex character "0" -> "F")
       masks = [ "0", "1", "2", ..., "F" ]
   """
   def get_masks(num) do
-    # Should only be using power-of-two numbers
+    # Should only be using power-of-16 numbers, but the math is inexact
     width = (:math.log2(num) / :math.log2(16)) |> Kernel.ceil;
     # IO.inspect(["BITS: ", num_bits])
-    nums     = Enum.to_list(0..num);
+    nums     = Enum.to_list(0..num-1);
     masks    = Enum.reduce(nums, [], fn id, acc ->
       # Make sure each has a standardized width (i.e. "1" -> "001" if width = 3)
       mask = String.pad_leading(Integer.to_string(id, 16), width, "0");
@@ -198,18 +201,12 @@ defmodule Server do
     underneath it.
   """
   @impl true
-  def init(state) do
-    # IO.inspect(state);
-
-    # IO.puts("Getting keys..");
-
-    [_public, _private] = get_keys();
-
-    # IO.puts("Got keys.");
-
+  def init(s) do
+    state = Map.new([{:num_supers, Enum.at(s,0)}]);
+    [public, private] = get_keys();
 
     # Get info
-    num_supers  = Enum.at(state,0)-1;
+    num_supers  = Map.get(state, :num_supers, 16);
 
     # Set up the masks
     [ mask_width , masks ] = get_masks(num_supers);
@@ -230,9 +227,10 @@ defmodule Server do
       GenServer.cast(target, {:map, [ mask_width, supers ]});
     end)
 
-    new_state = [ mask_width, supers, users ]
+    new_data    = Map.new([{:mask_width, mask_width},{:supers, supers}, {:users, users}, {:public, public}, {:private, private}]);
+    updated_map = Map.merge(state, new_data);
 
-    {:ok, new_state}
+    {:ok, updated_map}
   end
 
   @doc """
@@ -242,12 +240,10 @@ defmodule Server do
     Example:
       "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
   """
-  def get_hash(state, name) do
-    mask_width = Enum.at(state, 0);
-
+  def get_hash(width, name) do
     # Get the hash-based information
     hash       = :crypto.hash(:md5, name) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(mask_width-1));
+    hash_match = String.slice(hash, 0..(width-1));
 
     hash_match
   end
@@ -257,8 +253,7 @@ defmodule Server do
   """
   @impl true
   def handle_call({:register, name}, _from, state) do
-    users = Enum.at(state, 2);
-
+    users = Map.get(state, :users);
 
     # Init the user's conact list to be empty
     result = :ets.insert_new(users, {String.to_atom(name), []})
@@ -275,22 +270,26 @@ defmodule Server do
     Handles a client's attempt to log in.
   """
   @impl true
-  def handle_call({:join, name}, _from, state) do
-    supers     = Enum.at(state,1);
-    users      = Enum.at(state,2);
+  def handle_call({:join, name}, from, state) do
+    supers     = Map.get(state, :supers);
+    users      = Map.get(state, :users);
+    mask_width = Map.get(state, :mask_width);
 
     # Get the client information
     match = :ets.lookup(users, String.to_atom(name));
 
     if match != [] do
       # Hash the name to determine who to match it with
-      hash_match = get_hash(state, name);
+      hash_match = get_hash(mask_width, name);
       # Look up the corresponding super node
       matching_super = Map.get(supers, hash_match);
       # Strip away the wrapping structures
       contacts = elem(Enum.at(match,0),1);
+      # Create a token for the user
+      sending_pid = elem(from,0);
+      token = Signature.sign(Map.get(state,:private), sending_pid)
 
-      {:reply, [ matching_super, contacts ], state}
+      {:reply, Map.new([{:super, matching_super}, {:contacts, contacts}, {:token, token}]), state}
     else
       {:reply, :not_registered, state}
     end
@@ -300,13 +299,18 @@ defmodule Server do
     Updates a user's contact list.
   """
   @impl true
-  def handle_call({:update, name, list}, _from, state) do
-    users      = Enum.at(state,2);
+  def handle_call({:update, name, list, token}, from, state) do
+    users       = Map.get(state, :users);
+    sending_pid = elem(from,0);
+    result = Signature.check(Map.get(state, :public), token, sending_pid);
+    if result == :ok do
+      # Update the client information
+      :ets.insert(users, {String.to_atom(name), list});
 
-    # Update the client information
-    :ets.insert(users, {String.to_atom(name), list});
-
-    {:reply, :ok, state}
+      {:reply, :ok, state}
+    else
+      {:reply, :bad_token, state}
+    end
   end
 end
 
@@ -493,14 +497,19 @@ defmodule Client do
     response = GenServer.call(server, {:join, my_name});
 
     if response != :not_registered do
-      [ my_super, contacts ] = response;
+      my_super = Map.get(response, :super);
+      contacts = Map.get(response, :contacts);
       # IO.inspect(response);
 
-      # Join the super node.  return should be :ok if succeeded
-      result = GenServer.call(my_super, {:join, my_name});
-
-      if result != :ok do
-        IO.inspect(["Super join failed", self()]);
+      cond do
+        my_super != nil ->
+          # Join the super node.  return should be :ok if succeeded
+          result = GenServer.call(my_super, {:join, my_name});
+          if result != :ok do
+            IO.inspect(["Super join failed", self()]);
+          end
+        true ->
+          IO.inspect(["Super Lookup Failed.", my_name, self()]);
       end
 
       new_state = [my_name, my_super, contacts]

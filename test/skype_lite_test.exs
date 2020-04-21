@@ -33,7 +33,7 @@ defmodule SkypeLiteTest do
   end
 
   test "Super Node Check" do
- # Spawn some super nodes to work with.
+    # Spawn some super nodes to work with.
     {_ignore, super1}    = GenServer.start_link(Super, [Map.new()]);
     {_ignore, super2}    = GenServer.start_link(Super, [Map.new()]);
     {_ignore, super3}    = GenServer.start_link(Super, [Map.new()]);
@@ -93,6 +93,96 @@ defmodule SkypeLiteTest do
     result = GenServer.call(super1, {:lookup, "query"});
     assert result == nil
     IO.puts("Lookup Check -- No Matching User Passed");
+  end
+
+  test "Server Check" do
+    # Initialize some values
+    num_supers = 16;
+    {_ignore, server} = GenServer.start_link(Server, [num_supers]);
+
+    # Check the masks are generated as expected
+    width_16    = 1;
+    expected_16 = Enum.reduce(Enum.to_list(0..15), [], fn num, acc ->
+      str = String.pad_leading(Integer.to_string(num, 16), width_16, "0");
+      [str | acc]
+    end);
+    [ width, masks ] = Server.get_masks(16);
+    assert width == width_16;
+    assert masks == expected_16;
+    IO.puts("Mask Check -- Test Value 16 Passed");
+
+    width_256    = 2;
+    expected_256 = Enum.reduce(Enum.to_list(0..255), [], fn num, acc ->
+      str = String.pad_leading(Integer.to_string(num, 16), width_256, "0");
+      [str | acc]
+    end);
+    [ width, masks ] = Server.get_masks(256);
+    assert width_256 == width;
+    assert expected_256 == masks;
+    IO.puts("Mask Check -- Test Value 256 Passed");
+
+    width_4096    = 3;
+    expected_4096 = Enum.reduce(Enum.to_list(0..4095), [], fn num, acc ->
+      str = String.pad_leading(Integer.to_string(num, 16), width_4096, "0");
+      [str | acc]
+    end);
+    [ width, masks ] = Server.get_masks(4096);
+    assert width_4096 == width;
+    assert expected_4096 == masks;
+    IO.puts("Mask Check -- Test Value 4096 Passed");
+
+    # User Registration Positive Check
+    new_name = "Tommy";
+    result = GenServer.call(server, {:register, new_name});
+    assert result == :ok;
+    new_name = "NotTommy";
+    result = GenServer.call(server, {:register, new_name});
+    assert result == :ok;
+    IO.puts("Regisration Check -- Positive Passed");
+
+    # User Registration Negative Check
+    new_name = "Tommy";
+    result = GenServer.call(server, {:register, new_name});
+    assert result == :name_claimed;
+    new_name = "NotTommy";
+    result = GenServer.call(server, {:register, new_name});
+    assert result == :name_claimed;
+    IO.puts("Regisration Check -- Negative Passed");
+
+    # User Log In Positive Check
+    result = GenServer.call(server, {:join, "Tommy"});
+    assert Map.get(result, :contacts) == [];
+    assert Map.get(result, :super) != nil;
+    assert Map.get(result, :token) != nil;
+    result = GenServer.call(server, {:join, "NotTommy"});
+    assert Map.get(result, :contacts) == [];
+    assert Map.get(result, :super) != nil;
+    assert Map.get(result, :token) != nil;
+    IO.puts("Log In Check -- Positive Passed");
+
+    # User Log In Negative Check
+    result = GenServer.call(server, {:join, "DefinitelyNotTommy"});
+    assert result == :not_registered;
+    result = GenServer.call(server, {:join, "AlsoDefinitelyNotTommy"});
+    assert result == :not_registered;
+    IO.puts("Log In Check -- Negative Passed");
+
+    # Update Contacts Positive Check
+    info = GenServer.call(server, {:join, "Tommy"});
+    result = GenServer.call(server, {:update, "Tommy", ["NotTommy"], Map.get(info, :token)});
+    assert result == :ok;
+    info = GenServer.call(server, {:join, "NotTommy"});
+    result = GenServer.call(server, {:update, "NotTommy", ["Tommy"], Map.get(info, :token)});
+    assert result == :ok;
+    IO.puts("Update Contacts Check -- Positive Passed");
+
+    # Update Contacts Negative Check
+    [_public, private] = Server.get_keys();
+    new_pid   = spawn(fn -> :ok end);
+    bad_token = Signature.sign(private, new_pid)
+    result = GenServer.call(server, {:update, "OtherTommy", ["Tommy"], bad_token});
+    assert result == :bad_token;
+    IO.puts("Update Contacts Check -- Negative Passed");
 
   end
 
