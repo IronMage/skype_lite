@@ -1,4 +1,5 @@
 %{
+  "base2": {:hex, :base2, "0.1.0", "bc9e19f1578e1439010d26b1bee456f3ac980481a46c3643b24e15c40e1db0ed", [:mix], [], "hexpm", "a25eb2892e03f609fd5634aaf9a7795fb90f98dc9a7a495ed8c03b2844bbb647"},
   "binary": {:hex, :binary, "0.0.5", "20d816f7274ea34f1b673b4cff2fdb9ebec9391a7a68c349070d515c66b1b2cf", [:mix], [], "hexpm"},
   "ecc": {:hex, :ecc, "0.1.3", "a5ff8214a90a3ff52c3c04db411d07704c24704e1879d3eb8f2c9fc5d1c81cba", [:mix], [], "hexpm", "0255ffe6e2b2cbbc2445ec7de6d29e16b6b6d8eaf0a6ae99a299cc79162541db"},
   "ex_crypto": {:hex, :ex_crypto, "0.10.0", "af600a89b784b36613a989da6e998c1b200ff1214c3cfbaf8deca4aa2f0a1739", [:mix], [{:poison, ">= 2.0.0", [hex: :poison, repo: "hexpm", optional: false]}], "hexpm"},

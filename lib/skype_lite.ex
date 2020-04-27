@@ -38,36 +38,51 @@ defmodule Signature do
     end
   end
 
-  def sign(private, user, ttl \\ 30, scale \\ :second) do
+  def get_public_key() do
+    {:ok, pub_pem}  = File.read("./public_key.pem")
+    [pub_pem_entry | _ ]  = :public_key.pem_decode(pub_pem)
+    # Assuming first entry is the key you want (or only one key)
+    public_key  = :public_key.pem_entry_decode(pub_pem_entry)
+    public_key
+  end
+
+  def sign(private, user, name, ttl \\ 30, scale \\ :second) do
     # Get the important time information
     time    = Time.utc_now();
     expires = Time.to_string(Time.add(time,ttl,scale));
     # Convert the data to strings for signing
-    token   = "#{inspect user}<|>#{expires}";
+    token   = "#{inspect user}<|>#{name}<|>#{expires}";
     # Sign the data
     text = :public_key.encrypt_private(token, private, []);
     text
   end
 
-  def check(public, signed, user) do
+  @spec check({:RSAPublicKey, binary | integer, binary | integer}, binary, any, any) ::
+          :bad_data | :expired | :internal_error | :ok | :wrong_name | :wrong_pid
+  def check(public, signed, user_pid, user_name) do
     # Decrypt the data using the public key
     data = :public_key.decrypt_public(signed, public, []);
     # Did the decryption result in valid data?
     if String.valid?(data) and String.contains?(data, "<|>") do
       # Split our string
-      [target, expires] = String.split(data, "<|>");
+      [target_pid, target_name, expires] = String.split(data, "<|>");
       {_, check_time}   = Time.from_iso8601(expires);
       # Has the data expired?
       time_diff = Time.compare(Time.utc_now(),check_time);
-      if compare_pid(target, user) do
-        if time_diff == :lt do
+      cond do
+        compare_pid(target_pid, user_pid) and time_diff == :lt and target_name == user_name ->
           :ok
-        else
+        time_diff != :lt ->
           :expired
-        end
-      else
-        :wrong_user
+        not compare_pid(target_pid, user_pid) ->
+          :wrong_pid
+        target_name != user_name ->
+          :wrong_name
+        true ->
+          :internal_error
       end
+    else
+      :bad_data
     end
   end
 
@@ -176,24 +191,43 @@ defmodule Server do
     Masks are string representations of hex numbers, which are compared to the
     top n-bits of the hashed client name.
 
-    NOTE: Inputs should be in powers of 16.
+    NOTE: Inputs should be in powers of the provided.
 
     Example:
       16 super nodes
       width = 1 (16 machines can be represented in a single hex character "0" -> "F")
       masks = [ "0", "1", "2", ..., "F" ]
   """
-  def get_masks(num) do
-    # Should only be using power-of-16 numbers, but the math is inexact
-    width = (:math.log2(num) / :math.log2(16)) |> Kernel.ceil;
+  def get_masks(num, base \\ 16) do
+    # Should only be using power-of-base numbers, but the math is inexact
+    width = (:math.log2(num) / :math.log2(base)) |> Kernel.ceil;
     # IO.inspect(["BITS: ", num_bits])
     nums     = Enum.to_list(0..num-1);
     masks    = Enum.reduce(nums, [], fn id, acc ->
       # Make sure each has a standardized width (i.e. "1" -> "001" if width = 3)
-      mask = String.pad_leading(Integer.to_string(id, 16), width, "0");
+      mask = String.pad_leading(Integer.to_string(id, base), width, "0");
       [ mask | acc ]
     end)
     [ width, masks ]
+  end
+
+  @doc """
+    Generates a pseudo-random string for naming the super nodes.
+  """
+  def random_string() do
+    random_base_64 = :random.uniform(1_073_741_824) |> Integer.to_string |> Base.encode64;
+    hash = :crypto.hash(:md5, random_base_64) |> Base.encode16();
+    hash
+  end
+
+  @doc """
+    Generates log-in information for a super node.
+  """
+  def get_super_info() do
+    my_name = random_string() <> random_string();
+    my_pass = random_string() <> random_string() <> random_string() <> random_string();
+    m = Map.new([{:name, my_name}, {:password, my_pass}]);
+    m
   end
 
   @doc """
@@ -222,9 +256,15 @@ defmodule Server do
     users = :ets.new(:contact_list, [:set, :private]);
 
 
-    # Distribute the map so super nodes who to contact
+    # Distribute the map so super nodes who to contact, and give them registration info
     Enum.map(Map.values(supers), fn target ->
-      GenServer.cast(target, {:map, [ mask_width, supers ]});
+      # Timeout every 30 minutes
+      inputs = get_super_info();
+      token = Signature.sign(private, target, Map.get(inputs, :name), 1800, :second);
+      with_width  = Map.put(inputs, :mask_width, mask_width);
+      with_supers = Map.put(with_width, :supers, supers);
+      with_token  = Map.put(with_supers, :token, token);
+      GenServer.cast(target, {:map, with_token});
     end)
 
     new_data    = Map.new([{:mask_width, mask_width},{:supers, supers}, {:users, users}, {:public, public}, {:private, private}]);
@@ -240,12 +280,15 @@ defmodule Server do
     Example:
       "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
   """
-  def get_hash(width, name) do
+  def get_hash(width, name, base \\ 16) do
     # Get the hash-based information
-    hash       = :crypto.hash(:md5, name) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(width-1));
-
-    hash_match
+    hash = :crypto.hash(:md5, name);
+    cond do
+      base == 2 ->
+        String.slice(Base2.encode2(hash), 0..(width-1))
+      base == 16 ->
+        String.slice(Base.encode16(hash), 0..(width-1))
+    end
   end
 
   @doc """
@@ -287,7 +330,7 @@ defmodule Server do
       contacts = elem(Enum.at(match,0),1);
       # Create a token for the user
       sending_pid = elem(from,0);
-      token = Signature.sign(Map.get(state,:private), sending_pid)
+      token = Signature.sign(Map.get(state,:private), sending_pid, name)
 
       {:reply, Map.new([{:super, matching_super}, {:contacts, contacts}, {:token, token}]), state}
     else
@@ -302,7 +345,7 @@ defmodule Server do
   def handle_call({:update, name, list, token}, from, state) do
     users       = Map.get(state, :users);
     sending_pid = elem(from,0);
-    result = Signature.check(Map.get(state, :public), token, sending_pid);
+    result = Signature.check(Map.get(state, :public), token, sending_pid, name);
     if result == :ok do
       # Update the client information
       :ets.insert(users, {String.to_atom(name), list});
@@ -340,11 +383,18 @@ defmodule Super do
     shall be called by the top-level server to inform the super node of the other supers.
   """
   @impl true
-  def handle_cast({:map, [ mask_width, supers ]}, state) do
-    # Used for communication between other super nodes
-    with_supers = Map.put(state, :supers, supers);
-    with_width  = Map.put(with_supers, :mask_width, mask_width);
-    {:noreply, with_width}
+  def handle_cast({:map, values}, state) do
+    # Inputs packaged into Map already, just confirm that the token is valid before updating
+    token = Map.get(values, :token);
+    name  = Map.get(values, :name);
+    pub = Signature.get_public_key();
+    cond do
+      Signature.check(pub, token, self(), name) == :ok ->
+        new_values = Map.put(values,:public, pub);
+        {:noreply, new_values}
+      true ->
+        {:noreply, state}
+    end
   end
 
   @doc """
@@ -354,11 +404,15 @@ defmodule Super do
     Example:
       "example" => "1A79A4D60DE6718E8E5B326E338AE533" => "1A"
   """
-  def get_hash(width, name) do
+  def get_hash(width, name, base \\ 16) do
     # Get the hash-based information
-    hash       = :crypto.hash(:md5, name) |> Base.encode16;
-    hash_match = String.slice(hash, 0..(width-1));
-    hash_match
+    hash = :crypto.hash(:md5, name);
+    cond do
+      base == 2 ->
+        String.slice(Base2.encode2(hash), 0..(width-1))
+      base == 16 ->
+        String.slice(Base.encode16(hash), 0..(width-1))
+    end
   end
 
   @doc """
@@ -366,25 +420,32 @@ defmodule Super do
     using this function are registered to be found by others in the network.
   """
   @impl true
-  def handle_call({:join, name}, from, state) do
-    supers     = Map.get(state, :supers);
-    my_names   = Map.get(state, :names, Map.new());
-    mask_width = Map.get(state, :mask_width);
+  def handle_call({:join, name, token}, from, state) do
+    public_key = Map.get(state, :public);
+    user_pid   = elem(from, 0);
 
+    if Signature.check(public_key, token, user_pid, name) == :ok do
+      supers     = Map.get(state, :supers);
+      my_names   = Map.get(state, :names, Map.new());
+      mask_width = Map.get(state, :mask_width);
+      _my_token   = Map.get(state, :token);
 
-    # Get the hash-based information
-    hash_match = get_hash(mask_width, name);
-    contact_point = Map.get(supers, hash_match);
+      # Get the hash-based information
+      hash_match = get_hash(mask_width, name);
+      contact_point = Map.get(supers, hash_match);
 
-    # We're only accepting the clients for our list.
-    if contact_point == self() do
-      # Add a new entry for the client. "from" has extra data, just strip the PID
-      updated_names = Map.put(my_names, name, elem(from, 0));
-      updated_state = Map.put(state, :names, updated_names);
-      # IO.inspect(["JOINED at Super Node", self(), updated_map]);
-      {:reply, :ok, updated_state}
+      # We're only accepting the clients for our list.
+      if contact_point == self() do
+        # Add a new entry for the client. "from" has extra data, just strip the PID
+        updated_names = Map.put(my_names, name, user_pid);
+        updated_state = Map.put(state, :names, updated_names);
+        # IO.inspect(["JOINED at Super Node", self(), updated_map]);
+        {:reply, :ok, updated_state}
+      else
+        {:reply, :out_of_scope, state}
+      end
     else
-      {:reply, :out_of_scope, state}
+      {:reply, :bad_token, state}
     end
   end
 
@@ -393,56 +454,71 @@ defmodule Super do
     This is called when a client is logging off of the network (no longer avaialble).
   """
   @impl true
-  def handle_call({:leave, name}, from, state) do
-    supers     = Map.get(state, :supers);
-    my_names   = Map.get(state, :names, Map.new());
-    mask_width = Map.get(state, :mask_width);
+  def handle_call({:leave, name, token}, from, state) do
+    public_key = Map.get(state, :public);
+    user_pid   = elem(from, 0);
 
-    # Get the hash-based information
-    hash_match = get_hash(mask_width, name);
-    contact_point = Map.get(supers, hash_match);
+    if Signature.check(public_key, token, user_pid, name) == :ok do
+      supers     = Map.get(state, :supers);
+      my_names   = Map.get(state, :names, Map.new());
+      mask_width = Map.get(state, :mask_width);
 
-    # Are we in charge of this client? Make sure to check the client name against requester
-    same_person = Map.get(my_names, name) == elem(from, 0);
-    if contact_point == self() && same_person do
-      new_names = Map.delete(my_names, name);
-      new_state = Map.put(state, :names, new_names);
-      {:reply, :ok, new_state}
+      # Get the hash-based information
+      hash_match = get_hash(mask_width, name);
+      contact_point = Map.get(supers, hash_match);
+
+      # Are we in charge of this client? Make sure to check the client name against requester
+      same_person = Map.get(my_names, name) == elem(from, 0);
+      if contact_point == self() && same_person do
+        new_names = Map.delete(my_names, name);
+        new_state = Map.put(state, :names, new_names);
+        {:reply, :ok, new_state}
+      else
+        {:reply, :invalid_request, state}
+      end
     else
-      {:reply, :invalid_request, state}
+      {:reply, :bad_token, state}
     end
-
   end
 
   @doc """
     Used to search for a target client. Returns a PID/IP if found, otherwise nil.
   """
   @impl true
-  def handle_call({:lookup, target}, _from, state) do
-    supers     = Map.get(state, :supers);
-    my_names   = Map.get(state, :names, Map.new());
-    mask_width = Map.get(state, :mask_width);
+  def handle_call({:lookup, target, name, token}, from, state) do
+    public_key = Map.get(state, :public);
+    user_pid   = elem(from, 0);
 
-    # IO.inspect(["LOOKUP @", self(), target]);
+    if Signature.check(public_key, token, user_pid, name) == :ok do
+      supers     = Map.get(state, :supers);
+      my_names   = Map.get(state, :names, Map.new());
+      mask_width = Map.get(state, :mask_width);
+      my_token   = Map.get(state, :token);
+      my_name    = Map.get(state, :name);
 
-    # Hash the name to determine which supervisor to contact
-    hash_match = get_hash(mask_width, target);
+      # IO.inspect(["LOOKUP @", self(), target]);
 
-    # Figure out who to talk to
-    contact_point = Map.get(supers, hash_match);
+      # Hash the name to determine which supervisor to contact
+      hash_match = get_hash(mask_width, target);
 
-    cond do
-      contact_point == self() ->
-        # Attempt local lookup
-        pid = Map.get(my_names, target, nil);
-        {:reply, pid, state}
-      contact_point != nil ->
-        # Attempt remote query
-        pid = GenServer.call(contact_point, {:lookup, target});
-        {:reply, pid, state}
-      true ->
-        # Attempting to access a non-mapped server
-        {:reply, :no_matching_super, state}
+      # Figure out who to talk to
+      contact_point = Map.get(supers, hash_match);
+
+      cond do
+        contact_point == self() ->
+          # Attempt local lookup
+          pid = Map.get(my_names, target, nil);
+          {:reply, pid, state}
+        contact_point != nil ->
+          # Attempt remote query
+          reponse = GenServer.call(contact_point, {:lookup, target, my_name, my_token});
+          {:reply, reponse, state}
+        true ->
+          # Attempting to access a non-mapped server
+          {:reply, :no_matching_super, state}
+      end
+    else
+      {:reply, :bad_token, state}
     end
   end
 
@@ -471,10 +547,13 @@ defmodule Client do
   """
   @impl true
   def handle_cast({:lookup, target}, state) do
+    my_name = Enum.at(state, 0);
     my_super = Enum.at(state, 1);
+    my_token = Enum.at(state, 3);
+
 
     # Do a lookup
-    _pid = GenServer.call(my_super, {:lookup, target});
+    _pid = GenServer.call(my_super, {:lookup, target, my_name, my_token});
     # IO.inspect(["CLIENT GOT", pid]);
 
     {:noreply, state}
@@ -499,12 +578,13 @@ defmodule Client do
     if response != :not_registered do
       my_super = Map.get(response, :super);
       contacts = Map.get(response, :contacts);
+      my_token = Map.get(response, :token);
       # IO.inspect(response);
 
       cond do
         my_super != nil ->
           # Join the super node.  return should be :ok if succeeded
-          result = GenServer.call(my_super, {:join, my_name});
+          result = GenServer.call(my_super, {:join, my_name, my_token});
           if result != :ok do
             IO.inspect(["Super join failed", self()]);
           end
@@ -512,7 +592,7 @@ defmodule Client do
           IO.inspect(["Super Lookup Failed.", my_name, self()]);
       end
 
-      new_state = [my_name, my_super, contacts]
+      new_state = [my_name, my_super, contacts, my_token]
       {:noreply, new_state}
     else
       IO.puts("Client joined but not registered.")
