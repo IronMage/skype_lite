@@ -179,7 +179,7 @@ defmodule Simulation do
     Helper function to get a random subset of a specified length
   """
   def get_rand_set(pool, current, length) do
-    if length(current) == length do
+    if length(current) == length or length(pool) == 0 do
       current
     else
       choice   = Enum.random(pool);

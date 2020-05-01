@@ -24,3 +24,6 @@ skype_lite-*.tar
 
 # Ignore the compiled binary
 *.beam
+.elixir_ls/build/test/lib/skype_lite/.mix/compile.elixir
+
+.elixir_ls/dialyzer_manifest_21.3_elixir-1.10.2_test
