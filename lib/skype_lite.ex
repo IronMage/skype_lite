@@ -4,47 +4,68 @@ defmodule SkypeLite do
   """
 
   @doc """
+    Top-level function, called with 'mix run'.
   """
   def start(_type, _args) do
     # IO.inspect("Starting!");
     # {num_nodes, _} = Enum.at(System.argv(),0) |> Integer.parse
     # {num_reqs, _}  = Enum.at(System.argv(),1) |> Integer.parse
 
-    IO.puts("Ready to be run via SkypeLite.run()");
-    _ret = :observer.start;
+    # IO.puts("Ready to be run via SkypeLite.run()");
+    # _ret = :observer.start;
 
-    # run();
+    run();
 
     {:ok, self()}
   end
-  def run()  do
+
+  @doc """
+    Helper function to start up the simulation.
+  """
+  def run(sim_run_time \\ 30, lookups_per_client \\ 1024, num_clients \\ 10_000, num_super_nodes \\ 16)  do
     #Create a Dynamic Supervisor to track the children
     supers            = [{DynamicSupervisor, strategy: :one_for_one, name: SkypeLite.DynamicSupervisor}]
     _my_super         = Supervisor.start_link(supers, strategy: :one_for_one)
-    {_ignore, sim}    = DynamicSupervisor.start_child(SkypeLite.DynamicSupervisor,{Simulation, [10_000, 16]});
+    {_ignore, sim}    = DynamicSupervisor.start_child(SkypeLite.DynamicSupervisor,{Simulation, [num_clients, num_super_nodes]});
 
-    GenServer.call(sim, {:start}, :infinity)
+    # Start the simulation and have it run for setup time + run time seconds
+    GenServer.call(sim, {:start, sim_run_time, lookups_per_client}, :infinity)
     {:ok, sim}
   end
 end
 
 defmodule Signature do
+  @moduledoc """
+    Encapuslates public crypto functions and helper functions for ease of use.
+  """
+
+  @doc """
+    Compare the two input PIDs to determine if they're equivalent.  Handles
+    types of pid() and string.
+  """
   def compare_pid(target, user) do
-    # IO.inspect(["Comparing", target, user]);
+    # Determine if we need to do some input processing before comparing.
     cond do
+      # Same types, jsut compare
       (String.valid?(user) and String.valid?(target)) or (is_pid(user) and is_pid(target)) ->
         target == user;
+      # Mis-match, do some string manipulation
       is_pid(user) and String.valid?(target) ->
         temp = "#{inspect user}";
         "#{inspect target}" == "#{inspect temp}";
       String.valid?(user) and is_pid(target) ->
         temp = "#{inspect target}";
         "#{inspect target}" == "#{inspect temp}";
+      # Default case, compare always fails
       true ->
         false
     end
   end
 
+  @doc """
+    Retrieve the top-level server public key from disk.  This could be replaced
+    by any other pre-shared location.
+  """
   def get_public_key() do
     {:ok, pub_pem}  = File.read("./keys/public_key.pem")
     [pub_pem_entry | _ ]  = :public_key.pem_decode(pub_pem)
@@ -53,6 +74,10 @@ defmodule Signature do
     public_key
   end
 
+  @doc """
+    Sign the given username + PID pair with the key.  Has built-in expiration time
+    to force re-authentication and prevent replay attacks.
+  """
   def sign(private, user, name, ttl \\ 30, scale \\ :second) do
     if private != nil and user != nil and name != nil  do
       # Get the important time information
@@ -68,8 +93,10 @@ defmodule Signature do
     end
   end
 
-  @spec check({:RSAPublicKey, binary | integer, binary | integer}, binary, any, any) ::
-          :bad_data | :expired | :internal_error | :ok | :wrong_name | :wrong_pid
+  @doc """
+    Verifies that the signed token contains the given username + PID pair and that
+    it has not expired.
+  """
   def check(public, signed, user_pid, user_name) do
     if public != nil and signed != nil and user_pid != nil and user_name != nil do
       # Decrypt the data using the public key
@@ -107,28 +134,13 @@ end
 defmodule Simulation do
   use GenServer
   @moduledoc """
-    This simulation spwans all of the processes needed to run the system, and directs client
+    This simulation module spawns all of the processes needed to run the system, and directs client
     behavior to exercise the network.
   """
 
-  def start_link(state) do
+  def start_link(_state) do
     # [ Clients, Super Nodes ]
-    GenServer.start_link(__MODULE__, state)
-  end
-
-  @doc """
-    Based on the desired number of users,
-  """
-  def get_num_actual_users(number) do
-    # Skype peak concurrent users
-    peak_users    = 12_500_000;
-    # Other information is estimated to create a normal curve
-    avg_users     = 7_000_000;
-    sd            = 1_700_000;
-    todays_active = Statistics.Distributions.Normal.rand(avg_users,sd);
-    scale         = todays_active/peak_users;
-    active_users  = number*scale |> trunc;
-    active_users
+    GenServer.start_link(__MODULE__, [1024, 16])
   end
 
   @impl true
@@ -136,6 +148,9 @@ defmodule Simulation do
     {:ok, state}
   end
 
+  @doc """
+    Start the required super node children.
+  """
   def start_children(state) do
     # Get the information
     clis         = Enum.to_list(0..(Enum.at(state,0)-1));
@@ -149,7 +164,7 @@ defmodule Simulation do
       clis        = Enum.at(acc, 0);
       pid_to_name = Enum.at(acc, 1);
 
-      # Spawn the processes
+      # Spawn the processes with a random ID
       id = Integer.to_string(Enum.random(0..10_000_000_000));
       {_ignore, cli} = GenServer.start_link(Client, [id]);
 
@@ -174,14 +189,16 @@ defmodule Simulation do
     end
   end
 
+  @doc """
+    Called when the simulation is supposed to start.  If called with timeout = infinity,
+    the simulation will run the specified amount of time.
+  """
+
   @impl true
-  def handle_call({:start}, _from, state) do
+  def handle_call({:start, time, num_targets}, _from, state) do
     [top_server, clients, pid_map]  = start_children(state)
-    num_targets = length(clients)/4 |> trunc;
     cli_mean_delay = 15;
     cli_sd_delay   = 5;
-
-    # IO.inspect([top_server, clients])
 
     # Tell the 'clients' where to log in
     Enum.map(clients, fn cli ->
@@ -197,10 +214,9 @@ defmodule Simulation do
       GenServer.cast(cli, {:lookup, targets, cli_mean_delay, cli_sd_delay});
     end)
 
-    # Needs a better stop condition
-    Process.sleep(10000);
+    # Sleep for a while to let the simulation run.
+    Process.sleep(time*1000);
 
-    # IO.inspect(["Done"]);
     {:reply, "Done", [top_server, clients]}
   end
 end
@@ -459,12 +475,7 @@ defmodule Super do
     This is called after a fail is detected, and will call subsequently call the init() function.
   """
   def start_link(_state) do
-    # IO.inspect(["start_link", state]);
-    # [_pub, priv] = get_keys();
-    # signed_request = Signature.sign(priv, self(), "RECOVER");
-    # response = Genserver.call(:SkypeLiteServer, {:recover, signed_request});
-    # GenServer.start_link(__MODULE__, response)
-    GenServer.start_link(__MODULE__, [])
+    GenServer.start_link(__MODULE__, [Map.new()])
   end
 
   @doc """
@@ -473,15 +484,12 @@ defmodule Super do
   def get_keys() do
     {:ok, priv_pem} = File.read("./keys/private_super.pem")
     {:ok, pub_pem}  = File.read("./keys/public_super.pem")
-    [priv_pem_entry | _ ] = :public_key.pem_decode(priv_pem)
-    [pub_pem_entry | _ ]  = :public_key.pem_decode(pub_pem)
+    [priv_pem_entry | _ignore ] = :public_key.pem_decode(priv_pem)
+    [pub_pem_entry | _ignore ]  = :public_key.pem_decode(pub_pem)
     # Assuming first entry is the key you want (or only one key)
     private_key = :public_key.pem_entry_decode(priv_pem_entry)
     public_key  = :public_key.pem_entry_decode(pub_pem_entry)
     # text = :public_key.encrypt_public("plaintext", public_key, [])
-
-    # IO.inspect(text)
-    # text
     [public_key, private_key]
   end
 
@@ -633,25 +641,20 @@ defmodule Super do
         contact_point == self() ->
           # Attempt local lookup
           pid = Map.get(my_names, target, nil);
-          # if pid == nil do
-          #   IO.inspect(["Failed Self-Lookup",self(),target, my_names]);
-          # end
           {:reply, pid, state}
+
         contact_point != nil ->
           # Attempt remote query
           # Generate a psuedo-random timeout value to reduce call->call collisions
           rand_timeout = :rand.uniform(1500) + 10;
           try do
             reponse = GenServer.call(contact_point, {:lookup, target, my_name, my_token}, rand_timeout);
-            # if reponse == nil do
-            #   IO.inspect(["Failed Other-Lookup",contact_point,target]);
-            # end
             {:reply, reponse, state}
           catch
             :exit, {:timeout, _info} ->
-              # IO.inspect(["Call timeout", self(), info]);
               {:reply, :timeout, state}
             end
+
         true ->
           # Attempting to access a non-mapped server
           {:reply, :no_matching_super, state}
@@ -672,7 +675,7 @@ defmodule Client do
   """
 
   def start_link(_state) do
-    GenServer.start_link(__MODULE__, [:client_nums])
+    GenServer.start_link(__MODULE__, [])
   end
 
   @impl true
@@ -681,6 +684,9 @@ defmodule Client do
     {:ok, state}
   end
 
+  @doc """
+    Get a random delay in ms, governed by the normal distribution.
+  """
   def get_rand_delay(mean, sd) do
     rand_delay = Statistics.Distributions.Normal.rand(mean,sd) |> trunc;
     if rand_delay < 0 do
@@ -691,7 +697,7 @@ defmodule Client do
   end
 
   @doc """
-    Used to search for a target client.
+    Attempts to find the given target, delayed by a random time (using mean + standard deviation)
   """
   @impl true
   def handle_cast({:lookup, targets, mean, sd}, state) do
@@ -703,7 +709,7 @@ defmodule Client do
       target = Enum.at(targets, 0);
       # Do a lookup
       try do
-        repsonse = GenServer.call(my_super, {:lookup, target, my_name, my_token}, 20_000);
+        repsonse = GenServer.call(my_super, {:lookup, target, my_name, my_token}, 3000);
         # IO.puts("message");
         cond do
           repsonse == :expired ->
@@ -802,7 +808,7 @@ defmodule Client do
     catch
       # Retry the join logic if we timeout
       :exit, {:timeout, _info} ->
-        IO.puts("RE-TRYING JOIN");
+        # IO.puts("RE-TRYING JOIN");
         GenServer.cast(self(), {:join, server})
     end
   end
