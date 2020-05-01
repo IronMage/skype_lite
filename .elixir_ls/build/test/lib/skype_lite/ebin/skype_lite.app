@@ -1,5 +1,5 @@
 {application,skype_lite,
-             [{applications,[kernel,stdlib,elixir,logger,base2]},
+             [{applications,[kernel,stdlib,elixir,logger,base2,statistics]},
               {description,"skype_lite"},
               {modules,['Elixir.Client','Elixir.Server','Elixir.Signature',
                         'Elixir.Simulation','Elixir.SkypeLite',

@@ -43,6 +43,18 @@ defmodule SkypeLiteTest do
     # Expecting an expired
     assert result == :bad_data
     IO.puts("Public/Private Check -- Bad Token Passed.");
+
+    # Bad Input Result Check
+    result = Signature.sign(priv, self(), nil);
+    # Expecting an expired
+    assert result == :bad_input
+    IO.puts("Public/Private Sign -- Bad Input Passed.");
+
+    # Bad Input Result Check
+    result = Signature.check(pub, nil, self(), other_name);
+    # Expecting an expired
+    assert result == :bad_input
+    IO.puts("Public/Private Check -- Bad Input Passed.");
   end
 
   test "Super Node Check" do
