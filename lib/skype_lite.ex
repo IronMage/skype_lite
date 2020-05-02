@@ -14,7 +14,13 @@ defmodule SkypeLite do
     # IO.puts("Ready to be run via SkypeLite.run()");
     # _ret = :observer.start;
 
+    metrics = [
+      "Messages"
+    ]
+
+    Metrics.init(metrics);
     run();
+    Metrics.fetch_metrics(metrics);
 
     {:ok, self()}
   end
@@ -31,6 +37,25 @@ defmodule SkypeLite do
     # Start the simulation and have it run for setup time + run time seconds
     GenServer.call(sim, {:start, sim_run_time, lookups_per_client}, :infinity)
     {:ok, sim}
+  end
+end
+
+defmodule Metrics do
+  def init(metrics) do
+    Enum.map(metrics, fn met ->
+      :ets.new(String.to_atom(met), [:set, :public, :named_table]);
+    end)
+  end
+
+  def increment_counter(table, value, delta) do
+    :ets.update_counter(String.to_atom(table), value, delta, {1,0});
+  end
+
+  def fetch_metrics(metrics) do
+    Enum.map(metrics, fn met->
+      result = :ets.match(String.to_atom(met), :"$1")
+      IO.inspect(result);
+    end)
   end
 end
 
@@ -622,7 +647,9 @@ defmodule Super do
     public_key = Map.get(state, :public);
     user_pid   = elem(from, 0);
 
-    if Signature.check(public_key, token, user_pid, name) == :ok do
+    token_res = Signature.check(public_key, token, user_pid, name);
+
+    if token_res == :ok do
       supers     = Map.get(state, :supers);
       my_names   = Map.get(state, :names, Map.new());
       mask_width = Map.get(state, :mask_width);
@@ -660,7 +687,7 @@ defmodule Super do
           {:reply, :no_matching_super, state}
       end
     else
-      {:reply, :bad_token, state}
+      {:reply, token_res, state}
     end
   end
 
@@ -701,6 +728,7 @@ defmodule Client do
   """
   @impl true
   def handle_cast({:lookup, targets, mean, sd}, state) do
+    # IO.puts("lookup");
     my_name = Enum.at(state, 0);
     my_super = Enum.at(state, 1);
     my_token = Enum.at(state, 3);
@@ -709,10 +737,12 @@ defmodule Client do
       target = Enum.at(targets, 0);
       # Do a lookup
       try do
+        Metrics.increment_counter("Messages", "Sent", 1);
         repsonse = GenServer.call(my_super, {:lookup, target, my_name, my_token}, 3000);
         # IO.puts("message");
         cond do
           repsonse == :expired ->
+            Metrics.increment_counter("Messages", "Expired", 1);
             # IO.puts("TOKEN EXPIRED");
             # Refresh the token
             resp = GenServer.call(:SkypeLiteServer, {:join, my_name});
@@ -726,6 +756,11 @@ defmodule Client do
 
           # Retry the lookup
           repsonse == :timeout  or repsonse == nil->
+            if repsonse == :timeout do
+              Metrics.increment_counter("Messages", "Timeout", 1);
+            else
+              Metrics.increment_counter("Messages", "NotLoggedIn", 1);
+            end
             # IO.puts("TIMEOUT OR NIL");
             # Sleep to simulate random access
             delay = get_rand_delay(mean, sd);
@@ -736,6 +771,7 @@ defmodule Client do
 
           # Sucessful
           is_pid(repsonse) ->
+            Metrics.increment_counter("Messages", "Successful", 1);
             # IO.puts("GOOD MESSAGE");
             # Sleep to simulate random access
             delay = get_rand_delay(mean, sd);
@@ -746,12 +782,14 @@ defmodule Client do
 
           true ->
             # Catch all
+            Metrics.increment_counter("Messages", "OtherError", 1);
             IO.inspect([self(), repsonse]);
             {:noreply, state}
         end
       catch
         # My call timed out
         :exit, {:timeout, _info} ->
+          Metrics.increment_counter("Messages", "Timeout", 1);
           # Sleep to simulate random access
           delay = get_rand_delay(mean, sd);
           Process.sleep(delay);
@@ -769,10 +807,13 @@ defmodule Client do
   """
   @impl true
   def handle_cast({:join, server}, state) do
+    # IO.puts("join");
     my_name  = Enum.at(state, 0);
 
     # Spread out the :join requests
-    Process.sleep(get_rand_delay(1000, 300));
+    Process.sleep(get_rand_delay(3, 0.5));
+
+    # IO.puts("Starting request");
 
     try do
       # Register with the server first!
@@ -793,12 +834,15 @@ defmodule Client do
             result = GenServer.call(my_super, {:join, my_name, my_token});
             if result != :ok do
               IO.inspect(["Super join failed", self()]);
+            else
+              # IO.puts("Successfully joined");
             end
           true ->
             IO.inspect(["Super Lookup Failed.", my_name, self()]);
         end
 
         new_state = [my_name, my_super, contacts, my_token]
+
         {:noreply, new_state}
       else
         IO.puts("Client joined but not registered.")
@@ -808,7 +852,7 @@ defmodule Client do
     catch
       # Retry the join logic if we timeout
       :exit, {:timeout, _info} ->
-        # IO.puts("RE-TRYING JOIN");
+        IO.puts("RE-TRYING JOIN");
         GenServer.cast(self(), {:join, server})
     end
   end
