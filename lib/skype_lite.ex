@@ -7,7 +7,7 @@ defmodule SkypeLite do
     Top-level function, called with 'mix run'.
   """
   def start(_type, _args) do
-    # IO.inspect("Starting!");
+    # IO.inspect(args);
     # {num_nodes, _} = Enum.at(System.argv(),0) |> Integer.parse
     # {num_reqs, _}  = Enum.at(System.argv(),1) |> Integer.parse
 
@@ -42,9 +42,9 @@ defmodule SkypeLite do
     # Start the simulation and have it run for setup time + run time seconds
     GenServer.call(sim, {:start, sim_run_time, lookups_per_client}, :infinity)
 
-    IO.puts("Fetching metrics...");
+    # IO.puts("Fetching metrics...");
     # Fetch the metrics data
-    Metrics.fetch_metrics(metrics);
+    # Metrics.fetch_metrics(metrics);
 
     IO.puts("Setting up table storage...");
     # Save out the data
@@ -105,7 +105,7 @@ defmodule Metrics do
             [this_data | m]
           end)
           cur_pid = elem(Enum.at(entry, 0), 0);
-          [%{"pid" => cur_pid, "responses" => data_map} | acc]
+          [%{"client" => cur_pid, "responses" => data_map} | acc]
         end)
         map
 
@@ -116,7 +116,7 @@ defmodule Metrics do
 
   def store_metrics(metrics, file_name) do
     Enum.map(metrics, fn {met, _mode} ->
-      full_file_name = "#{file_name}_#{met}.txt";
+      full_file_name = "#{file_name}_#{met}.json";
       # stripped_name  = String.replace(full_file_name, ~r"[:]", "-");
       # IO.puts(full_file_name);
       result = :ets.match(String.to_atom(met), :"$1");
