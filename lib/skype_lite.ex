@@ -14,13 +14,7 @@ defmodule SkypeLite do
     # IO.puts("Ready to be run via SkypeLite.run()");
     # _ret = :observer.start;
 
-    metrics = [
-      "Messages"
-    ]
-
-    Metrics.init(metrics);
     run();
-    Metrics.fetch_metrics(metrics);
 
     {:ok, self()}
   end
@@ -29,21 +23,48 @@ defmodule SkypeLite do
     Helper function to start up the simulation.
   """
   def run(sim_run_time \\ 30, lookups_per_client \\ 1024, num_clients \\ 10_000, num_super_nodes \\ 16)  do
+    metrics = [
+      {"Messages", :set},
+      {"Responses", :bag}
+    ]
+
+    IO.puts("Setting up metrics...");
+    # Init the metrics tables
+    Metrics.init(metrics);
+
+    IO.puts("Setting up simulation...");
     #Create a Dynamic Supervisor to track the children
     supers            = [{DynamicSupervisor, strategy: :one_for_one, name: SkypeLite.DynamicSupervisor}]
     _my_super         = Supervisor.start_link(supers, strategy: :one_for_one)
     {_ignore, sim}    = DynamicSupervisor.start_child(SkypeLite.DynamicSupervisor,{Simulation, [num_clients, num_super_nodes]});
 
+    IO.puts("Starting simulation...");
     # Start the simulation and have it run for setup time + run time seconds
     GenServer.call(sim, {:start, sim_run_time, lookups_per_client}, :infinity)
-    {:ok, sim}
+
+    IO.puts("Fetching metrics...");
+    # Fetch the metrics data
+    Metrics.fetch_metrics(metrics);
+
+    IO.puts("Setting up table storage...");
+    # Save out the data
+    my_directory = "./databases/super#{num_super_nodes}_client#{num_clients}_lookups#{lookups_per_client}_sim#{sim_run_time}";
+    # my_directory = ".";
+    current_time = Time.utc_now();
+    my_file_name = "#{my_directory}/#{Time.to_string(current_time)}";
+
+    IO.puts("Storing metrics...");
+    Metrics.store_metrics(metrics, my_file_name);
+
+    # {:ok, sim}
+    :ok
   end
 end
 
 defmodule Metrics do
   def init(metrics) do
-    Enum.map(metrics, fn met ->
-      :ets.new(String.to_atom(met), [:set, :public, :named_table]);
+    Enum.map(metrics, fn {met, mode} ->
+      :ets.new(String.to_atom(met), [mode, :public, :named_table]);
     end)
   end
 
@@ -51,10 +72,60 @@ defmodule Metrics do
     :ets.update_counter(String.to_atom(table), value, delta, {1,0});
   end
 
+  def add_entry(table, data) do
+    :ets.insert(String.to_atom(table), data);
+  end
+
   def fetch_metrics(metrics) do
-    Enum.map(metrics, fn met->
+    Enum.map(metrics, fn {met, _mode}->
       result = :ets.match(String.to_atom(met), :"$1")
       IO.inspect(result);
+    end)
+  end
+
+  def list_to_json_map(list, met) do
+    cond do
+      met == "Messages" ->
+        map = Enum.reduce(list, Map.new(), fn entry, acc ->
+          [{tag, data}] = entry;
+          Map.put(acc, tag, data);
+        end)
+        map
+
+      met == "Responses" ->
+        map = Enum.reduce(list, [], fn entry, acc ->
+          data_map = Enum.reduce(entry, [], fn data, m->
+            {_pid, target, result, start_time, end_time, diff_time} = data;
+            this_data = Map.new([
+              {"target", target},
+              {"result", result},
+              {"start_time", Time.to_string(start_time)},
+              {"end_time", Time.to_string(end_time)},
+              {"diff_time_milli",diff_time}]);
+            [this_data | m]
+          end)
+          cur_pid = elem(Enum.at(entry, 0), 0);
+          [%{"pid" => cur_pid, "responses" => data_map} | acc]
+        end)
+        map
+
+      true ->
+        Map.new();
+    end
+  end
+
+  def store_metrics(metrics, file_name) do
+    Enum.map(metrics, fn {met, _mode} ->
+      full_file_name = "#{file_name}_#{met}.txt";
+      # stripped_name  = String.replace(full_file_name, ~r"[:]", "-");
+      # IO.puts(full_file_name);
+      result = :ets.match(String.to_atom(met), :"$1");
+      # IO.inspect(result);
+      my_map = list_to_json_map(result, met);
+      # IO.inspect(my_map);
+      {:ok, data} = Jason.encode(my_map);
+      # IO.inspect(["DATA", data]);
+      File.write(full_file_name, data);
     end)
   end
 end
@@ -690,7 +761,6 @@ defmodule Super do
       {:reply, token_res, state}
     end
   end
-
 end
 
 
@@ -738,10 +808,17 @@ defmodule Client do
       # Do a lookup
       try do
         Metrics.increment_counter("Messages", "Sent", 1);
-        repsonse = GenServer.call(my_super, {:lookup, target, my_name, my_token}, 3000);
+        before_msg = Time.utc_now();
+
+        response   = GenServer.call(my_super, {:lookup, target, my_name, my_token}, 3000);
+
+        after_msg  = Time.utc_now();
+        diff       = Time.diff(after_msg, before_msg, :millisecond);
+
+        Metrics.add_entry("Responses", {"#{inspect self()}", target, "#{inspect response}", before_msg, after_msg, diff});
         # IO.puts("message");
         cond do
-          repsonse == :expired ->
+          response == :expired ->
             Metrics.increment_counter("Messages", "Expired", 1);
             # IO.puts("TOKEN EXPIRED");
             # Refresh the token
@@ -755,8 +832,8 @@ defmodule Client do
             {:noreply, List.replace_at(state, 3, my_token)}
 
           # Retry the lookup
-          repsonse == :timeout  or repsonse == nil->
-            if repsonse == :timeout do
+          response == :timeout  or response == nil->
+            if response == :timeout do
               Metrics.increment_counter("Messages", "Timeout", 1);
             else
               Metrics.increment_counter("Messages", "NotLoggedIn", 1);
@@ -770,7 +847,7 @@ defmodule Client do
             {:noreply, state}
 
           # Sucessful
-          is_pid(repsonse) ->
+          is_pid(response) ->
             Metrics.increment_counter("Messages", "Successful", 1);
             # IO.puts("GOOD MESSAGE");
             # Sleep to simulate random access
@@ -783,7 +860,7 @@ defmodule Client do
           true ->
             # Catch all
             Metrics.increment_counter("Messages", "OtherError", 1);
-            IO.inspect([self(), repsonse]);
+            IO.inspect([self(), response]);
             {:noreply, state}
         end
       catch
