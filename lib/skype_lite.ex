@@ -7,10 +7,6 @@ defmodule SkypeLite do
     Top-level function, called with 'mix run'.
   """
   def start(_type, _args) do
-    # IO.inspect(args);
-    # {num_nodes, _} = Enum.at(System.argv(),0) |> Integer.parse
-    # {num_reqs, _}  = Enum.at(System.argv(),1) |> Integer.parse
-
     # IO.puts("Ready to be run via SkypeLite.run()");
     # _ret = :observer.start;
 
@@ -61,22 +57,38 @@ defmodule SkypeLite do
   end
 end
 
+
 defmodule Metrics do
+  # @moduledoc """
+  #   Used to collect performance metrics.
+  # """
   def init(metrics) do
+    # @doc """
+    #   Takes in a list of {name, mode} pairs to create tables in the DB.
+    # """
     Enum.map(metrics, fn {met, mode} ->
       :ets.new(String.to_atom(met), [mode, :public, :named_table]);
     end)
   end
 
   def increment_counter(table, value, delta) do
+    # @doc """
+    #   Increment a running counter.
+    # """
     :ets.update_counter(String.to_atom(table), value, delta, {1,0});
   end
 
   def add_entry(table, data) do
+    # @doc """
+    #   Insert the data into the metric table
+    # """
     :ets.insert(String.to_atom(table), data);
   end
 
   def fetch_metrics(metrics) do
+    # @doc """
+    #   Takes in a list of {name, mode} pairs and prints the results.
+    # """
     Enum.map(metrics, fn {met, _mode}->
       result = :ets.match(String.to_atom(met), :"$1")
       IO.inspect(result);
@@ -84,6 +96,9 @@ defmodule Metrics do
   end
 
   def list_to_json_map(list, met) do
+    # @doc """
+    #   Converts the raw metrics from the DB and format for the JSON encoder.
+    # """
     cond do
       met == "Messages" ->
         map = Enum.reduce(list, Map.new(), fn entry, acc ->
@@ -115,6 +130,9 @@ defmodule Metrics do
   end
 
   def store_metrics(metrics, file_name) do
+    # @doc """
+    #   Takes in a list of {name, mode} pairs to save the metrics to a file.
+    # """
     Enum.map(metrics, fn {met, _mode} ->
       full_file_name = "#{file_name}_#{met}.json";
       # stripped_name  = String.replace(full_file_name, ~r"[:]", "-");
@@ -129,6 +147,7 @@ defmodule Metrics do
     end)
   end
 end
+
 
 defmodule Signature do
   @moduledoc """
@@ -397,6 +416,22 @@ defmodule Server do
   end
 
   @doc """
+    Helper function to distribute the super node map
+  """
+  def distribute_map(supers, private, mask_width) do
+    # Distribute the map so super nodes who to contact, and give them registration info
+    Enum.map(Map.values(supers), fn target ->
+      # Timeout every 30 minutes
+      inputs = get_super_info();
+      token = Signature.sign(private, target, Map.get(inputs, :name), 1800, :second);
+      with_width  = Map.put(inputs, :mask_width, mask_width);
+      with_supers = Map.put(with_width, :supers, supers);
+      with_token  = Map.put(with_supers, :token, token);
+      GenServer.cast(target, {:map, with_token});
+    end)
+  end
+
+  @doc """
     Coordinates the intialization of the top-level server and the super nodes
     underneath it.
   """
@@ -417,21 +452,11 @@ defmodule Server do
       Map.put(acc, mask, spr);
     end);
 
+    distribute_map(supers, private, mask_width);
+
     # Create a database for the contact list.  Set = unique keys,
     # Private = only this process can access
     users = :ets.new(:contact_list, [:set, :private]);
-
-
-    # Distribute the map so super nodes who to contact, and give them registration info
-    Enum.map(Map.values(supers), fn target ->
-      # Timeout every 30 minutes
-      inputs = get_super_info();
-      token = Signature.sign(private, target, Map.get(inputs, :name), 1800, :second);
-      with_width  = Map.put(inputs, :mask_width, mask_width);
-      with_supers = Map.put(with_width, :supers, supers);
-      with_token  = Map.put(with_supers, :token, token);
-      GenServer.cast(target, {:map, with_token});
-    end)
 
     new_data    = Map.new([{:mask_width, mask_width},{:supers, supers}, {:users, users}, {:public, public}, {:private, private}]);
     updated_map = Map.merge(state, new_data);
@@ -439,41 +464,32 @@ defmodule Server do
     {:ok, updated_map}
   end
 
-  # @doc """
-  #   Supply a downed super node with the needed information.
-  # """
-  # def handle_call({:recover, name, token}, from, state) do
-  #   super_public_key = Map.get(state, :super_key, get_key("public_super.pem"));
+  @doc """
+    Spawns a new super node if one terminates.
+  """
+  @impl true
+  def handle_info({:EXIT, dead_pid, _reason}, state) do
+    priv       = Map.get(state, :private);
+    mask_width = Map.get(state, :mask_width);
+    supers     = Map.get(state, :supers)
 
-  #   if Signature.check(super_public_key, token, elem(from,0), name) == :ok do
-  #     # Get the required information
-  #     mask_width = Map.get(state, :mask_width);
-  #     supers     = Map.get(state, :supers);
-  #     private    = Map.get(state, :private);
 
-  #     [new_supers, _ignore] = Enum.reduce(Map.to_list(supers), [Map.new(), Map.new()], fn pair, acc ->
-  #       [my_map, added] = acc;
-  #       {key, value} = pair;
-  #       if Process.alive?(value) or Map.get(added, elem(from,0)) != nil do
-  #         [Map.put(my_map, key, value), Map.put(added, value, 0)]
-  #       else
-  #         [Map.put(my_map, key, elem(from,0)), Map.put(added, elem(from,0), 0)]
-  #       end
-  #     end)
+    # Spin up a new Super Node
+    {_ignore, spr} = GenServer.start_link(Super, [Map.new()]);
+    replaced_supers = Enum.reduce(Map.keys(supers), supers, fn k, old ->
+      if Map.get(old, k) == dead_pid do
+        Map.update!(old, k, fn _ignore -> spr end)
+      else
+        old
+      end
+    end)
 
-  #     # Generate new user/pass + token
-  #     inputs = get_super_info();
-  #     token = Signature.sign(private, elem(from,0), Map.get(inputs, :name), 1800, :second);
-  #     # Package it up
-  #     with_width  = Map.put(inputs, :mask_width, mask_width);
-  #     with_supers = Map.put(with_width, :supers, new_supers);
-  #     with_token  = Map.put(with_supers, :token, token);
-  #     s = Map.put(state, :super_key, super_public_key);
-  #     {:reply, with_token, Map.put(s, :supers, new_supers)}
-  #   else
-  #     {:reply, :bad_token, state}
-  #   end
-  # end
+    # Send out the information to everyone
+    distribute_map(replaced_supers, priv, mask_width);
+
+    {:noreply, Map.update!(state, :supers, fn _ignore -> replaced_supers end)}
+  end
+
 
   @doc """
     Processes the given name to get the section of hex bits used to match against
